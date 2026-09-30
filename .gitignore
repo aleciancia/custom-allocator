@@ -1,0 +1,3 @@
+test_allocator
+*.dSYM/
+.DS_Store
