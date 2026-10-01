@@ -15,6 +15,7 @@ The project includes a `Makefile` configured with Clang and AddressSanitizer for
 ```bash
 make
 ./test_allocator
+'''bash
 
 
 ## Benchmark
