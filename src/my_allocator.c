@@ -5,6 +5,12 @@
 
 static block_header_t *head = NULL;
 
+#ifdef BENCH
+
+unsigned long coalescing_count = 0;   
+size_t sbrk_bytes_total = 0;          
+#endif
+
 // FIX BUG 6: Allineamento a 16 byte (max_align_t)
 static size_t align16(size_t size) {
     return (size + 15) & ~15;
@@ -27,7 +33,7 @@ void print_memory_map() {
 static block_header_t *find_free_block(size_t size) {
     block_header_t *current = head;
     while (current) {
-        // Controllo validità tramite MAGIC
+        
         if (current->is_free && current->size >= size && current->magic == MAGIC) {
             return current;
         }
@@ -37,7 +43,7 @@ static block_header_t *find_free_block(size_t size) {
 }
 
 static void split_block(block_header_t *block, size_t size) {
-    // Lo splitting avviene solo se c'è spazio per un nuovo header e almeno 16 byte di payload
+    
     if (block->size >= size + HEADER_SIZE + 16) {
         block_header_t *new_block = (block_header_t *)((uint8_t *)block + HEADER_SIZE + size);
         new_block->size = block->size - size - HEADER_SIZE;
@@ -51,7 +57,7 @@ static void split_block(block_header_t *block, size_t size) {
 }
 
 static block_header_t *request_space(block_header_t *last, size_t size) {
-    // FIX BUG 2: Protezione da Integer Overflow su allocazioni enormi
+   
     if (size > SIZE_MAX - HEADER_SIZE) {
         return NULL;
     }
@@ -62,6 +68,9 @@ static block_header_t *request_space(block_header_t *last, size_t size) {
     if (request == (void *)-1) {
         return NULL;
     }
+#ifdef BENCH
+    sbrk_bytes_total += size + HEADER_SIZE;
+#endif
     
     if (last) {
         last->next = block;
@@ -106,13 +115,16 @@ void *my_malloc(size_t size) {
 static void coalesce() {
     block_header_t *current = head;
     while (current && current->next) {
-        // FIX BUG 1: Calcoliamo dove DOVREBBE trovarsi il prossimo blocco fisico
+       
         uint8_t *expected_next_addr = (uint8_t *)current + HEADER_SIZE + current->size;
         
-        // Fonde i blocchi SOLO se sono contigui nello spazio fisico dell'heap
+       
         if (current->is_free && current->next->is_free && (uint8_t *)current->next == expected_next_addr) {
             current->size += HEADER_SIZE + current->next->size;
             current->next = current->next->next;
+#ifdef BENCH
+            coalescing_count++;
+#endif
         } else {
             current = current->next;
         }
@@ -122,10 +134,10 @@ static void coalesce() {
 void my_free(void *ptr) {
     if (!ptr) return;
     
-    // Torniamo indietro per leggere l'header
+   
     block_header_t *block = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
     
-    // FIX BUG 7: Protezione contro puntatori invalidi e Double-Free
+   
     if (block->magic != MAGIC) {
         fprintf(stderr, "Errore: Tentativo di liberare un puntatore non valido!\n");
         return; 
@@ -142,7 +154,7 @@ void my_free(void *ptr) {
 void *my_calloc(size_t nmemb, size_t size) {
     if (nmemb == 0 || size == 0) return NULL;
     
-    // FIX BUG 3: Protezione contro overflow della moltiplicazione in calloc
+    
     if (size && nmemb > SIZE_MAX / size) {
         return NULL;
     }
@@ -170,13 +182,13 @@ void *my_realloc(void *ptr, size_t size) {
     
     block_header_t *block = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
     
-    // Rifiuta puntatori non validi
+  
     if (block->magic != MAGIC) return NULL;
     
     size_t aligned_size = align16(size);
     
     if (block->size >= aligned_size) {
-        // FIX BUG 5: Splitta il blocco e recupera memoria se lo stiamo riducendo
+       
         split_block(block, aligned_size);
         return ptr;
     }
@@ -184,7 +196,7 @@ void *my_realloc(void *ptr, size_t size) {
     void *new_ptr = my_malloc(size);
     if (!new_ptr) return NULL;
     
-    // FIX BUG 4: Copia strettamente il minimo necessario, evitando lettura di "spazzatura"
+    
     size_t copy_size = block->size;
     if (size < copy_size) {
         copy_size = size;
