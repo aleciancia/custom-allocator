@@ -3,34 +3,32 @@
 #include <stdint.h>
 #include <stdio.h>
 
-// La variabile globale DEVE stare qui in alto
 static block_header_t *head = NULL;
 
-// Funzione di debug per stampare la mappa
+// FIX BUG 6: Allineamento a 16 byte (max_align_t)
+static size_t align16(size_t size) {
+    return (size + 15) & ~15;
+}
+
 void print_memory_map() {
     block_header_t *current = head;
     int count = 0;
     printf("--- MAPPA DELLA MEMORIA ---\n");
-    if (!current) {
-        printf("Heap vuoto.\n");
-    }
+    if (!current) printf("Heap vuoto.\n");
     while (current) {
-        printf("Blocco %d: Size = %zu bytes | Free = %d | Indirizzo = %p\n",
-               count, current->size, current->is_free, (void*)current);
+        printf("Blocco %d: Size = %zu bytes | Free = %d | Magic = %X | Indirizzo = %p\n",
+               count, current->size, current->is_free, current->magic, (void*)current);
         current = current->next;
         count++;
     }
     printf("---------------------------\n\n");
 }
 
-static size_t align8(size_t size) {
-    return (size + 7) & ~7;
-}
-
 static block_header_t *find_free_block(size_t size) {
     block_header_t *current = head;
     while (current) {
-        if (current->is_free && current->size >= size) {
+        // Controllo validità tramite MAGIC
+        if (current->is_free && current->size >= size && current->magic == MAGIC) {
             return current;
         }
         current = current->next;
@@ -39,10 +37,12 @@ static block_header_t *find_free_block(size_t size) {
 }
 
 static void split_block(block_header_t *block, size_t size) {
-    if (block->size >= size + HEADER_SIZE + 8) {
+    // Lo splitting avviene solo se c'è spazio per un nuovo header e almeno 16 byte di payload
+    if (block->size >= size + HEADER_SIZE + 16) {
         block_header_t *new_block = (block_header_t *)((uint8_t *)block + HEADER_SIZE + size);
         new_block->size = block->size - size - HEADER_SIZE;
         new_block->is_free = 1;
+        new_block->magic = MAGIC;
         new_block->next = block->next;
         
         block->size = size;
@@ -51,6 +51,11 @@ static void split_block(block_header_t *block, size_t size) {
 }
 
 static block_header_t *request_space(block_header_t *last, size_t size) {
+    // FIX BUG 2: Protezione da Integer Overflow su allocazioni enormi
+    if (size > SIZE_MAX - HEADER_SIZE) {
+        return NULL;
+    }
+    
     block_header_t *block = sbrk(0);
     void *request = sbrk(size + HEADER_SIZE);
     
@@ -64,17 +69,16 @@ static block_header_t *request_space(block_header_t *last, size_t size) {
     
     block->size = size;
     block->is_free = 0;
+    block->magic = MAGIC;
     block->next = NULL;
     
     return block;
 }
 
 void *my_malloc(size_t size) {
-    if (size == 0) {
-        return NULL;
-    }
+    if (size == 0) return NULL;
     
-    size = align8(size);
+    size = align16(size);
     block_header_t *block;
     
     if (!head) {
@@ -96,13 +100,17 @@ void *my_malloc(size_t size) {
         }
     }
     
-    return (block + 1);
+    return (void *)((uint8_t *)block + HEADER_SIZE);
 }
 
 static void coalesce() {
     block_header_t *current = head;
     while (current && current->next) {
-        if (current->is_free && current->next->is_free) {
+        // FIX BUG 1: Calcoliamo dove DOVREBBE trovarsi il prossimo blocco fisico
+        uint8_t *expected_next_addr = (uint8_t *)current + HEADER_SIZE + current->size;
+        
+        // Fonde i blocchi SOLO se sono contigui nello spazio fisico dell'heap
+        if (current->is_free && current->next->is_free && (uint8_t *)current->next == expected_next_addr) {
             current->size += HEADER_SIZE + current->next->size;
             current->next = current->next->next;
         } else {
@@ -112,17 +120,33 @@ static void coalesce() {
 }
 
 void my_free(void *ptr) {
-    if (!ptr) {
+    if (!ptr) return;
+    
+    // Torniamo indietro per leggere l'header
+    block_header_t *block = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
+    
+    // FIX BUG 7: Protezione contro puntatori invalidi e Double-Free
+    if (block->magic != MAGIC) {
+        fprintf(stderr, "Errore: Tentativo di liberare un puntatore non valido!\n");
+        return; 
+    }
+    if (block->is_free) {
+        fprintf(stderr, "Errore: Rilevato Double-Free sullo stesso puntatore!\n");
         return;
     }
     
-    block_header_t *block = (block_header_t *)ptr - 1;
     block->is_free = 1;
-    
     coalesce();
 }
 
 void *my_calloc(size_t nmemb, size_t size) {
+    if (nmemb == 0 || size == 0) return NULL;
+    
+    // FIX BUG 3: Protezione contro overflow della moltiplicazione in calloc
+    if (size && nmemb > SIZE_MAX / size) {
+        return NULL;
+    }
+    
     size_t total_size = nmemb * size;
     void *ptr = my_malloc(total_size);
     
@@ -137,29 +161,38 @@ void *my_calloc(size_t nmemb, size_t size) {
 }
 
 void *my_realloc(void *ptr, size_t size) {
-    if (!ptr) {
-        return my_malloc(size);
-    }
+    if (!ptr) return my_malloc(size);
     
     if (size == 0) {
         my_free(ptr);
         return NULL;
     }
     
-    block_header_t *block = (block_header_t *)ptr - 1;
+    block_header_t *block = (block_header_t *)((uint8_t *)ptr - HEADER_SIZE);
     
-    if (block->size >= size) {
+    // Rifiuta puntatori non validi
+    if (block->magic != MAGIC) return NULL;
+    
+    size_t aligned_size = align16(size);
+    
+    if (block->size >= aligned_size) {
+        // FIX BUG 5: Splitta il blocco e recupera memoria se lo stiamo riducendo
+        split_block(block, aligned_size);
         return ptr;
     }
     
     void *new_ptr = my_malloc(size);
-    if (!new_ptr) {
-        return NULL;
+    if (!new_ptr) return NULL;
+    
+    // FIX BUG 4: Copia strettamente il minimo necessario, evitando lettura di "spazzatura"
+    size_t copy_size = block->size;
+    if (size < copy_size) {
+        copy_size = size;
     }
     
     uint8_t *src = (uint8_t *)ptr;
     uint8_t *dest = (uint8_t *)new_ptr;
-    for (size_t i = 0; i < block->size; i++) {
+    for (size_t i = 0; i < copy_size; i++) {
         dest[i] = src[i];
     }
     
